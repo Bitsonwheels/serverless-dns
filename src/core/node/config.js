@@ -12,12 +12,13 @@
  * This module has side effects, sequentially setting up the environment.
  */
 import { atob, btoa } from "buffer";
-import { fetch, Headers, Request, Response } from "undici";
+import process from "node:process";
 import * as util from "./util.js";
 import * as blocklists from "./blocklists.js";
+import * as dbip from "./dbip.js";
 import Log from "../log.js";
 import * as system from "../../system.js";
-import { services } from "../svc.js";
+import { services, stopAfter } from "../svc.js";
 import EnvManager from "../env.js";
 import * as swap from "../linux/swap.js";
 
@@ -31,45 +32,40 @@ async function prep() {
   const isProd = process.env.NODE_ENV === "production";
   const onFly = process.env.CLOUD_PLATFORM === "fly";
   const profiling = process.env.PROFILE_DNS_RESOLVES === "true";
-
-  let devutils = null;
-  let dotenv = null;
-
-  // dev utilities
-  if (!isProd) {
-    devutils = await import("./util-dev.js");
-    dotenv = await import("dotenv");
-  }
-
-  /** Environment Variables */
-  // Load env variables from .env file to process.env (if file exists)
-  // NOTE: this won't overwrite existing
-  if (dotenv) {
-    dotenv.config();
-    console.log("loading local .env");
-  }
+  const debugFly = onFly && process.env.FLY_APP_NAME.includes("-dev");
 
   globalThis.envManager = new EnvManager();
 
   /** Logger */
-  globalThis.log = new Log({
-    level: envManager.get("LOG_LEVEL"),
-    levelize: isProd || profiling, // levelize if prod or profiling
-    withTimestamps: true, // always log timestamps on node
-  });
+  globalThis.log = debugFly
+    ? new Log({
+        level: "debug",
+        levelize: profiling, // levelize only if profiling
+        withTimestamps: true, // always log timestamps on node
+      })
+    : new Log({
+        level: envManager.get("LOG_LEVEL"),
+        levelize: isProd || profiling, // levelize if prod or profiling
+        withTimestamps: true, // always log timestamps on node
+      });
 
   // ---- log and envManager available only after this line ---- \\
 
   /** TLS crt and key */
+  // If TLS_OFFLOAD == true, skip loading TLS certs and keys; otherwise:
   // Raw TLS CERT and KEY are stored (base64) in an env var for fly deploys
   // (fly deploys are dev/prod nodejs deploys where env TLS_CN or TLS_ is set).
   // Otherwise, retrieve KEY and CERT from the filesystem (this is the case
   // for local non-prod nodejs deploys with self-signed certs).
+  // If requisite TLS secrets are missing, set tlsoffload to true, eventually.
+  let tlsoffload = envManager.get("TLS_OFFLOAD");
   const _TLS_CRT_AND_KEY =
     eval(`process.env.TLS_${process.env.TLS_CN}`) || process.env.TLS_;
   const TLS_CERTKEY = process.env.TLS_CERTKEY;
 
-  if (isProd) {
+  if (tlsoffload) {
+    log.i("TLS offload enabled");
+  } else if (isProd) {
     if (TLS_CERTKEY) {
       const [tlsKey, tlsCrt] = util.getCertKeyFromEnv(TLS_CERTKEY);
       envManager.set("TLS_KEY", tlsKey);
@@ -81,28 +77,27 @@ async function prep() {
       envManager.set("TLS_CRT", tlsCrt);
       log.i("[deprecated] env (fly) tls setup with tls_cn");
     } else {
-      log.w("TLS termination: neither TLS_CERTKEY nor TLS_CN set");
+      log.w("Skip TLS: neither TLS_CERTKEY nor TLS_CN set; enable TLS offload");
+      tlsoffload = true;
     }
   } else {
-    const [tlsKey, tlsCrt] = devutils.getTLSfromFile(
-      envManager.get("TLS_KEY_PATH"),
-      envManager.get("TLS_CRT_PATH")
-    );
-    envManager.set("TLS_KEY", tlsKey);
-    envManager.set("TLS_CRT", tlsCrt);
-    log.i("dev (local) tls setup from tls_key_path");
+    try {
+      const devutils = await import("./util-dev.js");
+      const [tlsKey, tlsCrt] = devutils.getTLSfromFile(
+        envManager.get("TLS_KEY_PATH"),
+        envManager.get("TLS_CRT_PATH")
+      );
+      envManager.set("TLS_KEY", tlsKey);
+      envManager.set("TLS_CRT", tlsCrt);
+      log.i("dev (local) tls setup from tls_key_path");
+    } catch (ex) {
+      // this can happen when running server in BLOCKLIST_DOWNLOAD_ONLY mode
+      log.w("Skipping TLS: test TLS crt/key missing; enable TLS offload");
+      tlsoffload = true;
+    }
   }
 
-  /** Polyfills */
-  if (!globalThis.fetch) {
-    globalThis.fetch = isProd ? fetch : devutils.fetchPlus;
-    globalThis.Headers = Headers;
-    globalThis.Request = Request;
-    globalThis.Response = Response;
-    log.i("polyfill fetch web api");
-  } else {
-    log.i("no fetch polyfill required");
-  }
+  envManager.set("TLS_OFFLOAD", tlsoffload);
 
   if (!globalThis.atob || !globalThis.btoa) {
     globalThis.atob = atob;
@@ -136,6 +131,18 @@ async function up() {
   } else {
     log.w("Config", "blocklists unavailable / disabled");
   }
+  const lp = services.logPusher;
+  if (lp != null) {
+    try {
+      await dbip.setup(lp);
+    } catch (ex) {
+      log.e("Config", "dbip setup failed", ex);
+    }
+  } else {
+    log.w("Config", "logpusher unavailable");
+  }
+
+  process.on("SIGINT", (sig) => stopAfter());
 
   // signal all system are-a go
   system.pub("go");
